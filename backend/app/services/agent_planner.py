@@ -22,12 +22,21 @@ from __future__ import annotations
 
 import contextlib
 import json
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
 from app.prompts.planner_intro import build_planner_intro
 from app.schemas.agent_plan import Evidence, MarkForRevisionStep, PlanProposal
+from app.schemas.agent_progress import (
+    PlannerErrorKind,
+    PlanningStarted,
+    PlanReady,
+    ProposalFailed,
+    ProposalReady,
+    SpecialistFinished,
+    SpecialistStarted,
+)
 from app.schemas.agent_specialist import SpecialistFailure
 from app.schemas.parsed_response import ParsedToolCall
 from app.schemas.tools import GetWeakTopicsInput, GetWeakTopicsOutput
@@ -43,10 +52,13 @@ from app.transport.base import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from sqlalchemy.orm import Session as DbSession
 
     from app.models import TransportKind
     from app.schemas.agent_plan import ParsedPlan, Plan
+    from app.schemas.agent_progress import ProposalEvent
     from app.schemas.tools import WeakTopicInfo
     from app.services.agent_error_recorder import AgentErrorRecorder
     from app.services.embedding_service import Embedder
@@ -70,22 +82,6 @@ _PLANNER_TOOL_NAMES: tuple[str, ...] = ("get_weak_topics",)
 _ALLOWED_TOOLS = frozenset(_PLANNER_TOOL_NAMES)
 
 _SPECIALIST_UNAVAILABLE_MESSAGE = "Retrieval enrichment was unavailable for this topic."
-
-
-# Failure modes for the planner service. The route layer maps these
-# to HTTP status codes. wrong_response_kind from the diagnostic set
-# is absent deliberately: parse_plan_response only produces the two
-# planner shapes, so a wrong-kind terminal is unconstructable and
-# surfaces as parse_failed instead.
-type PlannerErrorKind = Literal[
-    "transport_failed",
-    "parse_failed",
-    "tool_handler_failed",
-    "disallowed_tool",
-    "no_data",
-    "ungrounded",
-    "unexpected",
-]
 
 
 class PlannerServiceError(Exception):
@@ -117,37 +113,130 @@ async def propose_plan(
     embedder: Embedder,
     transport_kind: TransportKind,
 ) -> PlanProposal:
-    """Open a planner chat, gather evidence, return the grounded plan.
+    """Consume proposal events and return or raise on the terminal.
 
-    Guards the empty state before any transport call, opens a fresh
-    chat with the static intro, drives the tool-call loop keeping
-    get_weak_topics results as Evidence, parses the terminal plan,
-    and checks groundedness before returning. Nothing mutates here:
-    the plan executes only when the caller approves it via
-    approve_plan.
+    The streaming generator is the single implementation of proposal
+    generation. This wrapper preserves the ordinary endpoint's
+    service contract by returning ProposalReady and translating
+    ProposalFailed back into PlannerServiceError.
+    """
+    async for event in stream_plan_proposal(
+        db=db,
+        transport=transport,
+        embedder=embedder,
+        transport_kind=transport_kind,
+    ):
+        if isinstance(event, ProposalReady):
+            return event.proposal
+        if isinstance(event, ProposalFailed):
+            raise PlannerServiceError(
+                event.message,
+                kind=event.error_kind,
+            )
 
-    transport_kind is accepted for signature symmetry with the
-    diagnostic service and the route deps, the flow has no
-    per-transport branching.
+    raise PlannerServiceError(
+        "Proposal generation ended without a terminal event.",
+        kind="unexpected",
+    )
 
-    Raises PlannerServiceError on empty state, transport failure,
-    parse failure, a disallowed tool call, a tool handler failure,
-    or an ungrounded plan.
+
+async def stream_plan_proposal(
+    *,
+    db: DbSession,
+    transport: LLMTransport[Any],
+    embedder: Embedder,
+    transport_kind: TransportKind,
+) -> AsyncIterator[ProposalEvent]:
+    """Yield proposal progress at planner and specialist boundaries.
+
+    The stream always starts with planning_started and ends with
+    exactly one proposal_ready or proposal_failed event. Application
+    failures are terminal data because an SSE response cannot change
+    its HTTP status after headers have been sent.
+
+    transport_kind is accepted for signature symmetry with the route
+    dependencies. The flow has no per-transport branching.
+    """
+    yield PlanningStarted()
+
+    try:
+        plan, planner_evidence, weak_topics = await _build_grounded_plan(
+            db=db,
+            transport=transport,
+            embedder=embedder,
+        )
+        yield PlanReady(plan=plan, evidence=planner_evidence)
+
+        specialist_evidence: list[Evidence] = []
+        total = len(plan.steps)
+        for position, step in enumerate(plan.steps, start=1):
+            if not isinstance(step, MarkForRevisionStep):
+                continue
+            topic_path = step.args.path
+            yield SpecialistStarted(
+                topic_path=topic_path,
+                position=position,
+                total=total,
+            )
+            outcome = await _gather_specialist_evidence(
+                db=db,
+                transport=transport,
+                embedder=embedder,
+                topic_path=topic_path,
+                weak_topic=weak_topics[topic_path],
+            )
+            specialist_evidence.append(outcome)
+            yield SpecialistFinished(
+                topic_path=topic_path,
+                position=position,
+                total=total,
+                evidence=outcome,
+            )
+
+        proposal = PlanProposal(
+            plan=plan,
+            evidence=[*planner_evidence, *specialist_evidence],
+        )
+    except PlannerServiceError as exc:
+        yield ProposalFailed(
+            error_kind=exc.kind,
+            message=exc.message,
+        )
+        return
+    except Exception as exc:
+        yield ProposalFailed(
+            error_kind="unexpected",
+            message=f"Unexpected error during planner flow: {exc}",
+        )
+        return
+
+    yield ProposalReady(proposal=proposal)
+
+
+async def _build_grounded_plan(
+    *,
+    db: DbSession,
+    transport: LLMTransport[Any],
+    embedder: Embedder,
+) -> tuple[Plan, list[Evidence], dict[str, WeakTopicInfo]]:
+    """Run the planner stage and return its grounded artifacts.
+
+    The planner chat is closed before specialist fan-out begins,
+    including every failure path.
     """
     await _check_plannable_state(db)
-
     intro = build_planner_intro()
 
     try:
         chat, response = await transport.start_new_chat(
             intro, _FIRST_MESSAGE, tool_names=_PLANNER_TOOL_NAMES
         )
-    except TransportError as e:
+    except TransportError as exc:
         raise PlannerServiceError(
-            f"Transport failed opening planner chat: {e.message}",
+            f"Transport failed opening planner chat: {exc.message}",
             kind="transport_failed",
-            cause=e,
-        ) from e
+            cause=exc,
+        ) from exc
 
     try:
         parsed, evidence = await _execute_until_plan(
@@ -158,32 +247,19 @@ async def propose_plan(
             db=db,
         )
     except PlannerServiceError:
-        # Close the chat even on failure. Planner chats are throwaway
-        # and leaving one open leaks transport state.
         await _close_quietly(transport, chat)
         raise
-    except Exception as e:
+    except Exception as exc:
         await _close_quietly(transport, chat)
         raise PlannerServiceError(
-            f"Unexpected error during planner flow: {e}",
+            f"Unexpected error during planner flow: {exc}",
             kind="unexpected",
-            cause=e,
-        ) from e
+            cause=exc,
+        ) from exc
 
     await _close_quietly(transport, chat)
-
     weak_topics = _assert_plan_grounded(parsed.plan, evidence)
-    specialist_evidence = await _gather_specialist_evidence(
-        db=db,
-        transport=transport,
-        embedder=embedder,
-        plan=parsed.plan,
-        weak_topics=weak_topics,
-    )
-    return PlanProposal(
-        plan=parsed.plan,
-        evidence=[*evidence, *specialist_evidence],
-    )
+    return parsed.plan, evidence, weak_topics
 
 
 async def approve_plan(
@@ -380,42 +456,33 @@ async def _gather_specialist_evidence(
     db: DbSession,
     transport: LLMTransport[Any],
     embedder: Embedder,
-    plan: Plan,
-    weak_topics: dict[str, WeakTopicInfo],
-) -> list[Evidence]:
-    """Enrich each grounded plan target with one specialist outcome.
+    topic_path: str,
+    weak_topic: WeakTopicInfo,
+) -> Evidence:
+    """Return one target's completed or failed specialist evidence.
 
-    Specialist failures degrade per target. The valid planner result
-    stays available, the failure is explicit in proposal evidence,
-    and later targets still run. The original get_weak_topics rows
-    remain the only evidence the approval guard trusts.
+    A specialist failure is data rather than a proposal failure, so
+    the generator can emit specialist_finished and continue to later
+    targets.
     """
-    evidence: list[Evidence] = []
-    for step in plan.steps:
-        if not isinstance(step, MarkForRevisionStep):
-            continue
-        topic_path = step.args.path
-        try:
-            result = await gather_grounding(
-                db=db,
-                transport=transport,
-                embedder=embedder,
-                topic_path=topic_path,
-                weak_topic=weak_topics[topic_path],
-            )
-        except SpecialistServiceError as exc:
-            failure = SpecialistFailure(
-                topic_path=topic_path,
-                error_kind=exc.kind,
-                message=_SPECIALIST_UNAVAILABLE_MESSAGE,
-            )
-            outcome_payload = failure.model_dump(mode="json")
-        else:
-            outcome_payload = result.model_dump(mode="json")
-        evidence.append(
-            Evidence(
-                tool="retrieval_specialist",
-                result=outcome_payload,
-            )
+    try:
+        result = await gather_grounding(
+            db=db,
+            transport=transport,
+            embedder=embedder,
+            topic_path=topic_path,
+            weak_topic=weak_topic,
         )
-    return evidence
+    except SpecialistServiceError as exc:
+        failure = SpecialistFailure(
+            topic_path=topic_path,
+            error_kind=exc.kind,
+            message=_SPECIALIST_UNAVAILABLE_MESSAGE,
+        )
+        outcome_payload = failure.model_dump(mode="json")
+    else:
+        outcome_payload = result.model_dump(mode="json")
+    return Evidence(
+        tool="retrieval_specialist",
+        result=outcome_payload,
+    )

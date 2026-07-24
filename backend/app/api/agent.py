@@ -1,11 +1,9 @@
-"""Agent propose/approve HTTP routes.
+"""Agent proposal and approval HTTP routes.
 
-Two POST endpoints exposing the bounded planner's stateless round
-trip. Propose runs the planning flow: the LLM reads state through
-the tool-call loop and the response is a mutate-only plan with the
-evidence that grounds it. Approve receives the pair back, re-checks
-groundedness, and executes the plan's mutations atomically under the
-orchestrator's transaction boundary.
+The bounded planner exposes ordinary and streamed proposal routes.
+Both produce a mutate-only plan with its grounding evidence. Approve
+receives that pair back, re-checks groundedness, and executes the
+mutations atomically under the orchestrator's transaction boundary.
 
 The prefix is /agent rather than /plan because the assistant surface
 grows beyond planning (specialists, evidence panel); this module is
@@ -14,7 +12,10 @@ its home.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from fastapi import APIRouter, HTTPException, status
+from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from app.api.deps import (
     AgentErrorRecorderDep,
@@ -34,7 +35,11 @@ from app.services.agent_planner import (
     PlannerServiceError,
     approve_plan,
     propose_plan,
+    stream_plan_proposal,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -83,6 +88,33 @@ async def propose(
         raise _map_planner_error(exc) from exc
 
     return AgentProposeResponse(plan=proposal.plan, evidence=proposal.evidence)
+
+
+@router.post("/propose/stream", response_class=EventSourceResponse)
+async def propose_stream(
+    body: AgentProposeRequest,
+    db: DbSession,
+    playwright: PlaywrightTransportDep,
+    deepseek: DeepseekTransportDep,
+    embedder: EmbedderDep,
+) -> AsyncIterator[ServerSentEvent]:
+    """Stream planning progress as named server-sent events.
+
+    Request validation still uses ordinary HTTP status codes. Once
+    headers are sent, application failures arrive as the typed
+    proposal_failed terminal event.
+    """
+    transport = pick_transport(body.transport_kind, playwright, deepseek)
+    async for event in stream_plan_proposal(
+        db=db,
+        transport=transport,
+        embedder=embedder,
+        transport_kind=body.transport_kind,
+    ):
+        yield ServerSentEvent(
+            event=event.kind,
+            data=event,
+        )
 
 
 @router.post("/approve", status_code=status.HTTP_204_NO_CONTENT)

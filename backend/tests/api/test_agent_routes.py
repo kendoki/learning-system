@@ -13,7 +13,8 @@ under test here.
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from app.api import agent
@@ -30,13 +31,23 @@ from app.schemas.agent_plan import (
     Plan,
     PlanProposal,
 )
+from app.schemas.agent_progress import (
+    PlannerErrorKind,
+    PlanningStarted,
+    ProposalEvent,
+    ProposalFailed,
+    ProposalReady,
+)
 from app.schemas.agent_specialist import SpecialistFinding, SpecialistResult
 from app.schemas.tools import MarkForRevisionInput
 from app.services.agent_error_recorder import NoOpAgentErrorRecorder
 from app.services.agent_orchestrator import AgentOrchestratorError
-from app.services.agent_planner import PlannerErrorKind, PlannerServiceError
+from app.services.agent_planner import PlannerServiceError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 TARGET_PATH = "Python > Data Types > Integers"
 
@@ -132,6 +143,81 @@ def test_propose_maps_error_kind_to_status(
 
 def test_propose_rejects_unknown_transport_kind(client: TestClient) -> None:
     response = client.post("/api/agent/propose", json={"transport_kind": "carrier_pigeon"})
+
+    assert response.status_code == 422
+
+
+def test_propose_stream_returns_named_sse_events(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST SSE serializes typed events with matching event names."""
+    proposal = _proposal()
+
+    async def fake_stream(**kwargs: Any) -> AsyncIterator[ProposalEvent]:
+        yield PlanningStarted()
+        yield ProposalReady(proposal=proposal)
+
+    monkeypatch.setattr(agent, "stream_plan_proposal", fake_stream)
+
+    response = client.post(
+        "/api/agent/propose/stream",
+        json={"transport_kind": "deepseek"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert [
+        line.removeprefix("event: ")
+        for line in response.text.splitlines()
+        if line.startswith("event: ")
+    ] == ["planning_started", "proposal_ready"]
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [payload["kind"] for payload in payloads] == [
+        "planning_started",
+        "proposal_ready",
+    ]
+    assert payloads[-1]["proposal"]["plan"]["steps"][0]["args"]["path"] == TARGET_PATH
+
+
+def test_propose_stream_returns_typed_failure_after_headers(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Streamed application failures stay on the event channel."""
+
+    async def fake_stream(**kwargs: Any) -> AsyncIterator[ProposalEvent]:
+        yield PlanningStarted()
+        yield ProposalFailed(error_kind="parse_failed", message="Planner response was invalid.")
+
+    monkeypatch.setattr(agent, "stream_plan_proposal", fake_stream)
+
+    response = client.post(
+        "/api/agent/propose/stream",
+        json={"transport_kind": "claude_playwright"},
+    )
+
+    assert response.status_code == 200
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert payloads[-1] == {
+        "kind": "proposal_failed",
+        "error_kind": "parse_failed",
+        "message": "Planner response was invalid.",
+    }
+    assert response.text.count("event: proposal_failed") == 1
+
+
+def test_propose_stream_rejects_unknown_transport_kind(client: TestClient) -> None:
+    response = client.post(
+        "/api/agent/propose/stream",
+        json={"transport_kind": "carrier_pigeon"},
+    )
 
     assert response.status_code == 422
 

@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict
 
 
 class AgentProposeRequest(BaseModel):
-    """Request body for POST /api/agent/propose.
+    """Request body for the agent proposal endpoints.
 
     Single field: which transport drives the planning chat. No
     session_id because the assistant has no session row.

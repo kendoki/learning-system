@@ -31,6 +31,14 @@ from app.models import (
 )
 from app.models.enums import GradingVerdict, LearningMode, SessionState
 from app.schemas.agent_plan import Evidence, MarkForRevisionStep, Plan, PlanProposal
+from app.schemas.agent_progress import (
+    PlanningStarted,
+    PlanReady,
+    ProposalFailed,
+    ProposalReady,
+    SpecialistFinished,
+    SpecialistStarted,
+)
 from app.schemas.agent_specialist import (
     SpecialistFailure,
     SpecialistFinding,
@@ -307,6 +315,91 @@ async def test_propose_degrades_failed_target_and_continues_fan_out(
     completed = SpecialistResult.model_validate(proposal.evidence[2].result)
     assert completed.status == "completed"
     assert completed.finding.topic_path == OTHER_PATH
+
+
+# ---------- streamed proposal progress ----------
+
+
+async def test_stream_proposal_emits_call_boundary_events_in_order(
+    db: DbSession,
+    specialist_calls: list[tuple[str, str]],
+) -> None:
+    """The stream exposes each orchestration boundary and one terminal.
+
+    One target distinguishes a real specialist boundary from a
+    planner-only spinner. The complete proposal must be the final
+    event, after that target's evidence has finished.
+    """
+    _seed_weak_topic(db)
+    transport = FakeTransport([_tool_call_response(), _plan_response(WEAK_PATH)])
+
+    events = [
+        event
+        async for event in agent_planner.stream_plan_proposal(
+            db=db,
+            transport=transport,
+            embedder=FakeEmbedder(),
+            transport_kind=TransportKind.DEEPSEEK,
+        )
+    ]
+
+    assert [event.kind for event in events] == [
+        "planning_started",
+        "plan_ready",
+        "specialist_started",
+        "specialist_finished",
+        "proposal_ready",
+    ]
+    assert isinstance(events[0], PlanningStarted)
+    plan_ready = events[1]
+    assert isinstance(plan_ready, PlanReady)
+    step = plan_ready.plan.steps[0]
+    assert isinstance(step, MarkForRevisionStep)
+    assert step.args.path == WEAK_PATH
+    assert plan_ready.evidence[0].tool == "get_weak_topics"
+    specialist_started = events[2]
+    assert isinstance(specialist_started, SpecialistStarted)
+    assert specialist_started.topic_path == WEAK_PATH
+    assert specialist_started.position == 1
+    assert specialist_started.total == 1
+    specialist_finished = events[3]
+    assert isinstance(specialist_finished, SpecialistFinished)
+    assert specialist_finished.topic_path == WEAK_PATH
+    assert specialist_finished.position == 1
+    assert specialist_finished.total == 1
+    assert specialist_finished.evidence.tool == "retrieval_specialist"
+    terminal = events[4]
+    assert isinstance(terminal, ProposalReady)
+    assert len(terminal.proposal.evidence) == 2
+    assert specialist_calls == [(WEAK_PATH, WEAK_PATH)]
+
+
+async def test_stream_proposal_emits_typed_failure_as_only_terminal(
+    db: DbSession,
+) -> None:
+    """An application failure is data after a stream has started."""
+    transport = FakeTransport([])
+
+    events = [
+        event
+        async for event in agent_planner.stream_plan_proposal(
+            db=db,
+            transport=transport,
+            embedder=FakeEmbedder(),
+            transport_kind=TransportKind.DEEPSEEK,
+        )
+    ]
+
+    assert [event.kind for event in events] == [
+        "planning_started",
+        "proposal_failed",
+    ]
+    terminal = events[-1]
+    assert isinstance(terminal, ProposalFailed)
+    assert terminal.error_kind == "no_data"
+    assert (
+        len([event for event in events if isinstance(event, ProposalReady | ProposalFailed)]) == 1
+    )
 
 
 # ---------- propose: no_data guard ----------
