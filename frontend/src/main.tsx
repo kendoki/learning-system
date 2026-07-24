@@ -33,7 +33,7 @@ createRoot(rootElement).render(
       <ThemeProvider defaultTheme="system">
         <QueryClientProvider client={queryClient}>
           <App />
-          {import.meta.env.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}
+          {import.meta.env.DEV && <ReactQueryDevtools buttonPosition="bottom-left" />}
         </QueryClientProvider>
       </ThemeProvider>
     </BrowserRouter>

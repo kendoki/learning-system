@@ -8,6 +8,7 @@
 
 export { ApiError } from "@/lib/api/client";
 export type { ApiErrorKind } from "@/lib/api/client";
+export * from "@/lib/api/agent";
 export * from "@/lib/api/browse";
 export * from "@/lib/api/diagnose";
 export * from "@/lib/api/documents";

@@ -62,24 +62,22 @@ export class ApiError extends Error {
     }
 }
 
-type ApiFetchOptions<T> = {
+export type ApiRequestOptions = {
     method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     body?: unknown;
-    schema: z.ZodType<T>;
     signal?: AbortSignal;
 }
 
-/**
- * Fetch a typed response from backend.
- *
- * Always validates the response against the given Zod schema; skipping
- * this is not an option because untyped response defeat the purpose
- * of having type client. Callers that genuinely do not care about
- * the response shape (rare) should pass `z.unknown()` explicitly.
- */
-export async function apiFetch<T> (path: string, options:ApiFetchOptions<T>): Promise<T> {
+type ApiFetchOptions<T> = ApiRequestOptions & {
+    schema: z.ZodType<T>;
+}
+
+export async function apiRequest(
+    path: string,
+    options: ApiRequestOptions = {},
+): Promise<Response> {
     const url = `${API_BASE_URL}${path}`;
-    const { method = "GET", body, schema, signal } = options;
+    const { method = "GET", body, signal } = options;
 
     const init: RequestInit = { method };
     if (body !== undefined) {
@@ -109,19 +107,41 @@ export async function apiFetch<T> (path: string, options:ApiFetchOptions<T>): Pr
         });
     }
 
+    return response;
+}
+
+/**
+ * Fetch a typed response from backend.
+ *
+ * Always validates the response against the given Zod schema; skipping
+ * this is not an option because untyped response defeat the purpose
+ * of having type client. Callers that genuinely do not care about
+ * the response shape (rare) should pass `z.unknown()` explicitly.
+ */
+export async function apiFetch<T> (path: string, options:ApiFetchOptions<T>): Promise<T> {
+    const { schema } = options;
+    const response = await apiRequest(path, options);
+
     let json: unknown;
     try {
         json = await response.json()
     } catch (error) {
-        throw new ApiError("parse", `Response from ${url} was not valid JSON`, { cause: error });
+        throw new ApiError("parse", `Response from ${path} was not valid JSON`, { cause: error });
     }
 
     const parsed = schema.safeParse(json);
     if (!parsed.success) {
-        throw new ApiError("parse", `Response from ${url} did not match schema`, {
+        throw new ApiError("parse", `Response from ${path} did not match schema`, {
             cause: parsed.error
         })
     }
 
     return parsed.data
+}
+
+export async function apiFetchVoid(
+    path: string,
+    options: ApiRequestOptions,
+): Promise<void> {
+    await apiRequest(path, options);
 }
